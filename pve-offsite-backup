@@ -1,0 +1,560 @@
+#!/bin/bash
+# pve-offsite-backup: nightly off-site backup of this Proxmox host into a restic repo (Backblaze B2).
+# Config: /etc/pve-offsite-backup/env (secrets, repo) and /etc/pve-offsite-backup/lxc.conf (excludes).
+set -uo pipefail
+umask 077
+
+readonly CONF_DIR=/etc/pve-offsite-backup
+readonly WORK=/run/pve-offsite-backup           # fixed path: restic groups snapshots by path
+readonly LOCK=/run/lock/pve-offsite-backup.lock
+readonly STATE_BASE=/var/lib/pve-offsite-backup # last prune/check times, one dir per repository
+readonly MIN_RESTIC=0.17.0                      # --stdin-from-command
+readonly VZDUMP_DIR=/var/lib/vz/dump            # dump dir of storage "local", see clean_vzdump_log
+HC_URL=
+PROM_TEXTFILE_DIR=
+STATE_DIR=
+MODE=
+RUN_START=
+REPO_BYTES=
+failed=()
+declare -A CT_SKIP=()
+CONF_IDS=()
+CONF_PATHS=()
+
+usage() {
+	cat <<'EOF'
+usage: pve-offsite-backup                 full nightly run (what the systemd timer starts)
+       pve-offsite-backup VMID [VMID...]  back up only these CTs, running or stopped, ignoring "skip"
+       pve-offsite-backup restic ARGS...  run restic against the repo, e.g. "restic snapshots"
+
+Setting RESTIC_REPOSITORY in the environment points the run at another repo (e.g. a local
+trial); healthcheck pings and metrics are then off and prune/check bookkeeping is kept separately.
+EOF
+}
+
+log() {
+	printf '%s %s\n' "$(date '+%F %T')" "$*";
+}
+
+# healthchecks.io style dead-man switch
+# $1 = "/start", "/fail" or "", $2 = log text
+ping_hc() {
+	[ -n "$HC_URL" ] || return 0
+	curl -fsS -m 10 --retry 3 -o /dev/null --data-raw "${2:-}" "$HC_URL$1" ||
+		log "warning: healthcheck ping failed"
+}
+
+# config/setup error: nothing (more) gets backed up
+die() {
+	log "ERROR: $*"
+	[ "$MODE" = nightly ] && ping_hc /fail "ERROR: $*"
+	exit 1
+}
+
+load_config() {
+	local repo_override=${RESTIC_REPOSITORY:-}
+	local v
+
+	[ -r "$CONF_DIR/env" ] || die "cannot read $CONF_DIR/env"
+
+	# shellcheck source=/dev/null
+	. "$CONF_DIR/env" || die "error in $CONF_DIR/env"
+
+	HC_URL=${HC_URL:-}
+	PROM_TEXTFILE_DIR=${PROM_TEXTFILE_DIR:-}
+	if [ -n "$repo_override" ]; then
+		RESTIC_REPOSITORY=$repo_override
+		HC_URL=
+		PROM_TEXTFILE_DIR=
+		[ "$MODE" = restic ] || log "RESTIC_REPOSITORY from environment ($RESTIC_REPOSITORY): healthcheck pings and metrics off"
+	fi
+
+	for v in RESTIC_REPOSITORY RESTIC_PASSWORD_FILE; do
+		[ -n "${!v:-}" ] || die "$v is not set in $CONF_DIR/env"
+	done
+
+	if [[ $RESTIC_REPOSITORY == s3:* ]]; then
+		for v in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do
+			[ -n "${!v:-}" ] || die "$v is not set in $CONF_DIR/env"
+		done
+	fi
+
+	[ -r "$RESTIC_PASSWORD_FILE" ] || die "cannot read RESTIC_PASSWORD_FILE ($RESTIC_PASSWORD_FILE)"
+	export RESTIC_REPOSITORY RESTIC_PASSWORD_FILE AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+	export RESTIC_COMPRESSION=${RESTIC_COMPRESSION:-max}
+
+	# systemd gives a system service no $HOME, and without a cache restic would re-download
+	# index and metadata from B2 on every call
+	export RESTIC_CACHE_DIR=${RESTIC_CACHE_DIR:-/var/cache/pve-offsite-backup}
+
+	# Hash the url to give it a sensible folder name
+	STATE_DIR=$STATE_BASE/$(printf '%s' "$RESTIC_REPOSITORY" | sha256sum | cut -c1-12)
+
+	command -v restic >/dev/null || die "restic is not installed (apt install restic)"
+
+	v=$(restic version | awk '{print $2; exit}')
+	[ "$(printf '%s\n' "$MIN_RESTIC" "$v" | sort -V | head -n1)" = "$MIN_RESTIC" ] ||
+		die "restic $v is too old, need $MIN_RESTIC or newer"
+}
+
+# fills CONF_IDS/CONF_PATHS (excludes) and CT_SKIP
+# Dies on any malformed line
+load_lxc_conf() {
+	local n=0 line id path rest errs=()
+	[[ -r $CONF_DIR/lxc.conf ]] || die "cannot read $CONF_DIR/lxc.conf"
+
+	while IFS= read -r line || [[ -n $line ]]; do  # "|| -n": last line without newline
+		((++n))
+		line=${line%$'\r'}  # strips from the end, for CRLF
+		line=${line%%#*}    # %% strips longest match after, for comments
+
+		read -r id path rest <<<"$line"
+
+		[[ -z $id ]] && continue
+
+		if [[ ! $id =~ ^([0-9]+|all)$ || -z $path || -n $rest ]]; then
+			errs+=("line $n: '$line' (want: <vmid|all> <path|skip>)")
+		elif [[ $path == skip ]]; then
+			if [[ $id == all ]]; then
+				errs+=("line $n: 'all skip' would skip every container")
+			else
+				CT_SKIP[$id]=1
+			fi
+		else
+			CONF_IDS+=("$id")
+			CONF_PATHS+=("$path")
+		fi
+	done < "$CONF_DIR/lxc.conf"
+
+	[ ${#errs[@]} -eq 0 ] || die "$CONF_DIR/lxc.conf: ${errs[*]}"
+}
+
+check_backup_config() {
+	local v c
+
+	command -v pct >/dev/null || die "must be run on a Proxmox VE host (pct not found)"
+
+	for c in restic sqlite3 curl; do
+		command -v "$c" >/dev/null || die "$c is not installed (run: apt install $c)"
+	done
+
+	load_lxc_conf
+	if [ "$MODE" = nightly ]; then
+		for v in OPN_HOST OPN_KEY OPN_SECRET OPN_PIN; do
+			[[ -n ${!v:-} ]] || die "$v is not set in $CONF_DIR/env"
+		done
+
+		# plain decimal numbers only: they end up in bash arithmetic and restic flags
+		PRUNE_INTERVAL_DAYS=${PRUNE_INTERVAL_DAYS:-7}
+		KEEP_DAILY=${KEEP_DAILY:-7}
+		KEEP_WEEKLY=${KEEP_WEEKLY:-4}
+		KEEP_MONTHLY=${KEEP_MONTHLY:-3}
+		REPO_MAX_MB=${REPO_MAX_MB:-9000}
+
+		for v in PRUNE_INTERVAL_DAYS KEEP_DAILY KEEP_WEEKLY KEEP_MONTHLY REPO_MAX_MB; do
+			[[ ${!v} =~ ^[0-9]+$ ]] || die "$v must be a whole number, got '${!v}'"
+		done
+
+		(( 10#$PRUNE_INTERVAL_DAYS >= 1 )) || die "PRUNE_INTERVAL_DAYS must be at least 1"
+		(( 10#$KEEP_DAILY + 10#$KEEP_WEEKLY + 10#$KEEP_MONTHLY > 0 )) || die "KEEP_DAILY/WEEKLY/MONTHLY cannot all be 0"
+	fi
+}
+
+# one backup at a time
+take_lock() {
+	exec 9>"$LOCK" || die "cannot open $LOCK"
+	flock -n 9 || die "another pve-offsite-backup run is in progress"
+}
+
+# $1 = vmid; sets EXCL (vzdump args - skip paths inside the container)
+ct_excludes() {
+	local i
+	EXCL=()
+	for i in "${!CONF_IDS[@]}"; do
+		if [[ ${CONF_IDS[i]} == all || ${CONF_IDS[i]} == "$1" ]]; then
+			EXCL+=(--exclude-path "${CONF_PATHS[$i]}")
+		fi
+	done
+}
+
+# Even with --stdout, vzdump copies its log into the dump dir of storage "local"
+clean_vzdump_log() {
+	local f stamp
+	for f in "$VZDUMP_DIR/vzdump-lxc-$1-"*.log; do
+		[[ -f $f ]] || continue
+		stamp=${f##*/vzdump-lxc-"$1"-}
+		stamp=${stamp%.log}
+		[[ $stamp =~ ^[0-9]{4}(_[0-9]{2}){2}-[0-9]{2}(_[0-9]{2}){2}$ ]] || continue
+		[[ $stamp < $2 ]] && continue
+		compgen -G "${f%.log}.tar*" >/dev/null && continue
+		rm -f -- "$f"
+	done
+}
+
+# $1 = vmid,
+# $2 = 1 to ignore "skip"
+backup_ct() {
+	local id=$1 force=${2:-0} name started
+
+	if ! name=$(pct config "$id" 2>/dev/null | awk '/^hostname:/ {print $2}'); then
+		log "CT $id: no such container"
+		failed+=("ct-$id")
+		return
+	fi
+
+	if [[ -n ${CT_SKIP[$id]:-} && $force = 0 ]]; then
+		log "CT $id ($name): skipped (lxc.conf)"
+		return
+	fi
+
+	ct_excludes "$id"
+	log "CT $id ($name): backing up"
+	started=$(date +%Y_%m_%d-%H_%M_%S)
+
+	# stream vzdump directly on restic, doesn't write on disk
+	#
+	# The subshell gives vzdump a normal umask. Under our 077 its temp dir (mkdir, mode from
+	# umask) is root-only, and the tar of an unprivileged CT runs as the mapped root
+	# (uid 100000), which then cannot enter it: every such backup fails with exit 255.
+	# restic sets its own modes on repo and cache files, so 022 loosens nothing there.
+	if (
+		umask 022
+		restic backup \
+			--host "$HOST_TAG" \
+			--tag lxc \
+			--tag "ct-$id" \
+			--tag "name-${name:-unknown}" \
+			--stdin-filename "ct-$id.tar" \
+			--stdin-from-command -- vzdump "$id" \
+			--mode snapshot \
+			--stdout 1 \
+			--compress 0 \
+			--quiet 1 "${EXCL[@]}"
+	); then
+		log "CT $id ($name): ok"
+	else
+		# --quiet hides vzdump's own error, it is only in its log
+		log "CT $id ($name): FAILED, no snapshot made (vzdump's reason: /var/log/vzdump/lxc-$id.log)"
+		failed+=("ct-$id")
+	fi
+
+	clean_vzdump_log "$id" "$started"
+}
+
+backup_all_cts() {
+	local list id status name known=" " running=()
+
+	if ! list=$(pct list); then
+		log "pct list FAILED, no containers backed up"
+		failed+=(ct-discovery)
+		return
+	fi
+
+	while read -r id status name; do
+		known+="$id "
+		if [[ $status == running ]]; then
+			running+=("$id")
+		elif [[ -z ${CT_SKIP[$id]:-} ]]; then
+			log "CT $id ($name): $status, not backed up (its last snapshot is kept)"
+		fi
+	done < <(awk 'NR > 1 {print $1, $2, $NF}' <<<"$list" | sort -n)
+
+	for id in "${CONF_IDS[@]}" "${!CT_SKIP[@]}"; do
+		if [[ $id != all && $known != *" $id "* ]]; then
+			log "lxc.conf mentions CT $id, which does not exist (typo?)"
+			failed+=("lxc.conf:$id")
+			known+="$id "  # don't warn multiple times for the same CT
+		fi
+	done
+
+	if (( ${#running[@]} == 0 )); then
+		log "no running containers found, nothing backed up"
+		failed+=(ct-discovery)
+		return
+	fi
+
+	for id in "${running[@]}"; do
+		backup_ct "$id"
+	done
+}
+
+# $1 = label, $2 = failure tag, $3 = restic exit code
+restic_result() {
+	case $3 in
+	0) log "$1: ok" ;;
+	3)
+		log "$1: PARTIAL snapshot saved, some files could not be read (see above)"
+		failed+=("$2-partial")
+		;;
+	*)
+		log "$1: FAILED (restic exit $3), no snapshot made"
+		failed+=("$2")
+		;;
+	esac
+}
+
+# $1 = file name inside $WORK; prints its path, cleared of any leftover from a killed run
+work_file() {
+	{ [ -d "$WORK" ] || mkdir -m 700 -- "$WORK"; } && rm -f -- "$WORK/$1" && printf '%s\n' "$WORK/$1"
+}
+
+backup_pve_db() {
+	local f
+
+	# -readonly: a wrong path must fail instead of creating and "backing up" an empty DB
+	if f=$(work_file pve-cluster-config.db) &&
+		[ -f /var/lib/pve-cluster/config.db ] &&
+		sqlite3 -readonly /var/lib/pve-cluster/config.db ".backup '$f'"; then
+		restic backup --host "$HOST_TAG" --tag pve-db "$f"
+		restic_result "pve cluster db" pve-db $?
+	else
+		log "pve cluster db: FAILED (copy), no snapshot made"
+		failed+=(pve-db)
+	fi
+
+	[[ -n ${f:-} ]] && rm -f -- "$f"
+}
+
+backup_opnsense() {
+	local f
+
+	# -k because the self-signed GUI cert is allowed to expire;
+	# the pinned public key is still verified, so nobody else can answer for $OPN_HOST.
+	# Credentials go via stdin (-K -), not argv.
+	if f=$(work_file opnsense-config.xml) &&
+		printf 'user = "%s:%s"\n' "$OPN_KEY" "$OPN_SECRET" |
+		curl -fsS -k --pinnedpubkey "sha256//$OPN_PIN" -m 60 -K - -o "$f" \
+			"https://$OPN_HOST/api/core/backup/download/this" &&
+		grep -q '<opnsense>' "$f" &&
+		grep -q '</opnsense>' "$f"; then
+		restic backup --host "$HOST_TAG" --tag opnsense "$f"
+		restic_result "OPNsense config.xml" opnsense $?
+	else
+		log "OPNsense config.xml: FAILED (download or incomplete file), no snapshot made"
+		failed+=(opnsense)
+	fi
+
+	[[ -n ${f:-} ]] && rm -f -- "$f"
+}
+
+backup_host_files() {
+	local paths=() p
+
+	# a missing path changes the snapshot's path list, so it lands in a new group and
+	# cannot push the complete snapshots out through retention
+	for p in ${HOST_PATHS:-/etc /root /usr/local /var/spool/cron}; do
+		if [ -e "$p" ]; then
+			paths+=("$p")
+		else
+			log "host path $p does not exist (fix HOST_PATHS in env)"
+			failed+=("missing:$p")
+		fi
+	done
+
+	if [ ${#paths[@]} -eq 0 ]; then
+		log "host files: nothing to back up"
+		failed+=(host-files)
+		return
+	fi
+
+	restic backup --host "$HOST_TAG" --tag host --exclude-caches --exclude /root/.cache "${paths[@]}"
+	restic_result "host files" host-files $?
+}
+
+# $1 = state name; true if not done within PRUNE_INTERVAL_DAYS (1 h slack for timer jitter)
+due() {
+	local last
+	last=$(cat "$STATE_DIR/$1" 2>/dev/null) || last=0
+	[[ $last =~ ^[0-9]+$ ]] || last=0
+	[ $(($(date +%s) - last)) -ge $((10#$PRUNE_INTERVAL_DAYS * 86400 - 3600)) ]
+}
+
+# a lost marker would repeat prune/check every night, so it counts as a failure
+mark_done() {
+	if ! { mkdir -p -- "$STATE_DIR" && date +%s > "$STATE_DIR/$1"; }; then
+		log "cannot record $1 in $STATE_DIR"
+		failed+=("state:$1")
+	fi
+}
+
+retention() {
+	if due last-prune; then
+		if [ ${#failed[@]} -gt 0 ]; then
+			log "retention: prune postponed, this run had failures"
+		else
+			log "retention: forget + prune"
+			if restic forget --host "$HOST_TAG" --prune --keep-daily "$KEEP_DAILY" \
+				--keep-weekly "$KEEP_WEEKLY" --keep-monthly "$KEEP_MONTHLY"; then
+				mark_done last-prune
+			else
+				failed+=(prune)
+			fi
+		fi
+	fi
+
+	if due last-check; then  # read-only, so it runs even when prune was postponed
+		log "retention: restic check"
+		if restic check; then
+			mark_done last-check
+		else
+			failed+=(check)
+		fi
+	fi
+}
+
+# Fails the run once the repo (compressed + deduplicated) is over REPO_MAX_MB.
+# Measured after retention, so it is the size this night leaves behind. 0 = no limit;
+# the size is then only measured when the metrics want it.
+check_size() {
+	local out bytes mb
+	(( 10#$REPO_MAX_MB > 0 )) || [ -n "$PROM_TEXTFILE_DIR" ] || return 0
+
+	if ! out=$(restic stats --mode raw-data --json --quiet) ||
+		! bytes=$(grep -o '"total_size":[0-9]*' <<<"$out" | cut -d: -f2) || [ -z "$bytes" ]; then
+		log "repo size: FAILED to read (restic stats)"
+		failed+=(size-check)
+		return
+	fi
+
+	REPO_BYTES=$bytes
+	mb=$((bytes / 1000000))  # decimal MB, like B2 counts
+	if (( 10#$REPO_MAX_MB == 0 )); then
+		log "repo size: ${mb} MB"
+	elif (( mb > 10#$REPO_MAX_MB )); then
+		log "repo size: ${mb} MB, OVER the ${REPO_MAX_MB} MB limit (lower KEEP_*, exclude or skip more)"
+		failed+=(size)
+	else
+		log "repo size: ${mb} MB of ${REPO_MAX_MB} MB ($((mb * 100 / 10#$REPO_MAX_MB))%)"
+	fi
+}
+
+# $1 = text; prints it escaped for use as a Prometheus label value
+prom_label() {
+	local v=$1
+	v=${v//\\/\\\\}
+	v=${v//\"/\\\"}
+	printf '%s' "${v//$'\n'/\\n}"
+}
+
+# Metrics for node_exporter's textfile collector: one file, replaced in one move at the end of
+# every nightly run. A run that dies before this point leaves the old file, so last_run goes
+# stale; alert on its age. last_success only moves on a night without any failure.
+write_metrics() {
+	[ -n "$PROM_TEXTFILE_DIR" ] || return 0
+	local out=$PROM_TEXTFILE_DIR/pve_offsite_backup.prom now ok items f
+
+	if ! items=$(restic snapshots --json --quiet --host "$HOST_TAG" |
+		pve-offsite-backup-sizes --prom --since "$RUN_START"); then
+		log "metrics: per-item numbers FAILED (restic snapshots | pve-offsite-backup-sizes)"
+		failed+=(metrics)
+		items=
+	fi
+
+	[ ${#failed[@]} -gt 0 ] || mark_done last-success
+	ok=$(cat "$STATE_DIR/last-success" 2>/dev/null) || ok=0
+	[[ $ok =~ ^[0-9]+$ ]] || ok=0
+	now=$(date +%s)
+
+	if {
+		cat <<EOF
+# HELP pve_offsite_backup_last_run_timestamp_seconds End of the last nightly run that got as far as writing metrics.
+# TYPE pve_offsite_backup_last_run_timestamp_seconds gauge
+pve_offsite_backup_last_run_timestamp_seconds $now
+# HELP pve_offsite_backup_last_success_timestamp_seconds End of the last nightly run without any failure.
+# TYPE pve_offsite_backup_last_success_timestamp_seconds gauge
+pve_offsite_backup_last_success_timestamp_seconds $ok
+# HELP pve_offsite_backup_last_run_duration_seconds Duration of the last nightly run.
+# TYPE pve_offsite_backup_last_run_duration_seconds gauge
+pve_offsite_backup_last_run_duration_seconds $((now - RUN_START))
+# HELP pve_offsite_backup_failed_items Number of failures in the last nightly run.
+# TYPE pve_offsite_backup_failed_items gauge
+pve_offsite_backup_failed_items ${#failed[@]}
+# HELP pve_offsite_backup_failure One series per failure of the last nightly run.
+# TYPE pve_offsite_backup_failure gauge
+EOF
+		for f in "${failed[@]}"; do
+			printf 'pve_offsite_backup_failure{reason="%s"} 1\n' "$(prom_label "$f")"
+		done
+		if [ -n "$REPO_BYTES" ]; then
+			cat <<EOF
+# HELP pve_offsite_backup_repo_size_bytes Data the snapshots use in the repo, compressed and deduplicated.
+# TYPE pve_offsite_backup_repo_size_bytes gauge
+pve_offsite_backup_repo_size_bytes $REPO_BYTES
+EOF
+		fi
+		if (( 10#$REPO_MAX_MB > 0 )); then
+			cat <<EOF
+# HELP pve_offsite_backup_repo_size_limit_bytes REPO_MAX_MB: the run fails above this size.
+# TYPE pve_offsite_backup_repo_size_limit_bytes gauge
+pve_offsite_backup_repo_size_limit_bytes $((10#$REPO_MAX_MB * 1000000))
+EOF
+		fi
+		[ -z "$items" ] || printf '%s\n' "$items"
+	} > "$out.tmp" && chmod 644 "$out.tmp" && mv -f -- "$out.tmp" "$out"; then
+		log "metrics: written to $out"
+	else
+		rm -f -- "$out.tmp"
+		log "metrics: FAILED to write $out"
+		failed+=(metrics)
+	fi
+}
+
+# ---- main
+case ${1:-} in
+'') MODE=nightly ;;
+restic) MODE=restic ;;
+-h | --help)
+	usage
+	exit 0
+	;;
+*)
+	for a in "$@"; do
+		[[ $a =~ ^[0-9]+$ ]] || {
+			usage >&2
+			exit 2
+		}
+	done
+	MODE=manual
+	;;
+esac
+
+load_config
+if [ "$MODE" = restic ]; then
+	shift
+	exec restic "$@"
+fi
+
+check_backup_config
+take_lock
+
+# remove the plaintext config.xml / cluster DB copies even if the run is killed (timeout, SIGTERM)
+trap 'rm -rf -- "$WORK"' EXIT
+trap 'log "interrupted"; [ "$MODE" = nightly ] && ping_hc /fail "interrupted"; exit 130' INT TERM HUP
+HOST_TAG=$(hostname -s)
+RUN_START=$(date +%s)
+
+if [ "$MODE" = manual ]; then
+	for id in "$@"; do
+		backup_ct "$id" 1
+	done
+else
+	ping_hc /start
+	restic unlock || true  # only removes stale locks left by a crashed run
+	backup_all_cts
+	backup_pve_db
+	backup_opnsense
+	backup_host_files
+	retention
+	check_size
+	write_metrics
+fi
+
+if [ ${#failed[@]} -gt 0 ]; then
+	log "FAILED: ${failed[*]}"
+	[ "$MODE" = nightly ] && ping_hc /fail "FAILED: ${failed[*]}"
+	exit 1
+fi
+
+log "all ok"
+[ "$MODE" = nightly ] && ping_hc "" "all ok"
+exit 0

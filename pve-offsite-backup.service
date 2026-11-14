@@ -1,0 +1,13 @@
+[Unit]
+Description=Off-site backup of LXCs, host and OPNsense config to B2 (restic)
+Wants=network-online.target
+# a catch-up run at boot (Persistent=true) waits until onboot guests have been started
+After=network-online.target pve-guests.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/pve-offsite-backup
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+TimeoutStartSec=6h

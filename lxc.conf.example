@@ -1,0 +1,40 @@
+# /etc/pve-offsite-backup/lxc.conf -- per-container tweaks for pve-offsite-backup
+#
+#   <vmid|all>  <exclude>   vzdump --exclude-path glob; "/x/?*" = contents of /x in the CT,
+#                           "x/?*" = contents of any directory named x. Use "?*" so the
+#                           (empty) directory itself is kept and the app still starts after a restore.
+#   <vmid>      skip        leave this CT out of the nightly run
+#
+# Bind mounts are never included by vzdump
+# Lis usage of CT: pct exec <vmid> -- du -xh -d3 / 2>/dev/null | sort -h | tail -20
+
+# Not all of /var/cache: /var/cache/debconf holds package configuration answers, not a cache.
+all  /var/cache/apt/archives/?*
+all  /var/cache/apt/*.bin               # package index caches, rebuilt by any apt command
+all  /var/lib/apt/lists/*_*             # downloaded package lists
+all  /var/cache/apk/?*                  # same for alpine
+all  .cache/?*                          # per-user caches (pip, npm, ...), any directory named .cache
+all  MediaCover/?*                      # *arr poster images, fetched again automatically
+all  /var/log/journal/?*                # systemd journal: binary, rewritten daily; journald recreates its subdir
+
+# media servers: keep config + library DB (users, watch state), drop caches, images, transcodes
+137  /var/cache/jellyfin/?*
+137  /var/lib/jellyfin/transcodes/?*
+137  /var/lib/jellyfin/metadata/?*
+137  /var/lib/jellyfin/data/trickplay/?*    # seek-preview images, rebuilt by the trickplay task
+137  /var/lib/jellyfin/data/subtitles/?*    # subtitles extracted from the media files, extracted again on demand
+
+# reverse proxy: logs
+118  /var/log/traefik/?*
+
+# pihole: query-log database, recreated empty on start
+172  /etc/pihole/pihole-FTL.db*
+
+# Stored data can get big, keep configs, drop the data
+731  /var/lib/prometheus/data/?*
+
+# stateless, rebuilt from scratch faster than restored
+524  skip                               # e.g. flaresolverr
+
+# a CT whose disk is mostly cache: check with du, then exclude the cache path or skip it
+596  skip

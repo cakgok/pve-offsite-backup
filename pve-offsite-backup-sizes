@@ -1,0 +1,110 @@
+#!/usr/bin/python3
+"""pve-offsite-backup-sizes: what each backed-up item costs.
+
+    pve-offsite-backup restic snapshots --json | pve-offsite-backup-sizes
+        table, biggest first
+
+    ... | pve-offsite-backup-sizes --prom [--since EPOCH]
+        the same numbers as Prometheus metrics (the nightly run calls this)
+
+An item is a container (ct-100), "host", "pve-db" or "opnsense". Only its newest
+snapshot is looked at:
+    tar     what vzdump produced for the CT (uncompressed)
+    stored  what that snapshot added to the repo (compressed, after dedup)
+"""
+import argparse
+import json
+import re
+import sys
+from datetime import datetime
+
+
+def newest_snapshot_per_item(snapshots):
+    """Return one row per item, taken from the item's newest snapshot."""
+    newest = {}
+    for snap in snapshots:
+        # the script tags every snapshot: "ct-100" + "name-traefik", or "host", ...
+        item = ",".join(snap.get("paths") or [])  # fallback for untagged snapshots
+
+        name = ""
+        for tag in snap.get("tags") or []:
+            if tag.startswith("name-"):
+                name = tag[len("name-"):]
+            elif tag in ("host", "pve-db", "opnsense") or re.fullmatch(r"ct-\d+", tag):
+                item = tag
+
+        when = datetime.fromisoformat(snap["time"]).timestamp()
+        if item not in newest or when > newest[item]["when"]:
+            newest[item] = {"item": item, "name": name, "when": when, "summary": snap.get("summary")}
+
+    rows = []
+    for row in newest.values():
+        summary = row["summary"]
+        if summary is None:  # snapshot made by a restic older than 0.17
+            continue
+        row["tar"] = summary["total_bytes_processed"]
+        row["stored"] = summary["data_added_packed"]
+        rows.append(row)
+    return rows
+
+
+def print_table(rows):
+    total_tar = sum(row["tar"] for row in rows)
+    total_stored = sum(row["stored"] for row in rows)
+
+    print(f"{'item':<9} {'name':<16} {'tar MB':>10} {'stored MB':>10} {'share':>6}")
+    for row in sorted(rows, key=lambda row: row["stored"], reverse=True):
+        share = 100 * row["stored"] / total_stored if total_stored else 0
+        print(
+            f"{row['item']:<9} {row['name']:<16} "
+            f"{row['tar'] / 1e6:>10.0f} {row['stored'] / 1e6:>10.0f} {share:>5.1f}%"
+        )
+    print(f"{'TOTAL':<9} {'':<16} {total_tar / 1e6:>10.0f} {total_stored / 1e6:>10.0f}")
+
+
+def label(text):
+    """Escape text for use inside a Prometheus label value."""
+    return text.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
+def print_prom(rows, since):
+    # an item that was not backed up in the last run (stopped CT, failure) added nothing
+    for row in rows:
+        row["added"] = row["stored"] if row["when"] >= since else 0
+
+    metrics = [
+        # (metric, help text, which value of the row)
+        ("item_snapshot_timestamp_seconds", "Start of the newest snapshot of the item.", "when"),
+        ("item_size_bytes",
+         "Size of the item in its newest snapshot, before compression and deduplication.", "tar"),
+        ("item_added_bytes",
+         "What the last run added to the repo for the item, compressed and deduplicated;"
+         " 0 if it was not backed up.", "added"),
+    ]
+    for metric, help_text, key in metrics:
+        print(f"# HELP pve_offsite_backup_{metric} {help_text}")
+        print(f"# TYPE pve_offsite_backup_{metric} gauge")
+
+        for row in sorted(rows, key=lambda row: row["item"]):
+            labels = f'item="{label(row["item"])}"'
+            if row["name"]:
+                labels += f',name="{label(row["name"])}"'
+            print(f"pve_offsite_backup_{metric}{{{labels}}} {int(row[key])}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Sizes per backed-up item, from 'restic snapshots --json' on stdin.")
+    parser.add_argument("--prom", action="store_true", help="print Prometheus metrics instead of the table")
+    parser.add_argument("--since", type=int, default=0, metavar="EPOCH",
+                        help="with --prom: start of the last run; older snapshots count as 'added 0'")
+    args = parser.parse_args()
+
+    rows = newest_snapshot_per_item(json.load(sys.stdin))
+    if args.prom:
+        print_prom(rows, args.since)
+    else:
+        print_table(rows)
+
+
+if __name__ == "__main__":
+    main()
